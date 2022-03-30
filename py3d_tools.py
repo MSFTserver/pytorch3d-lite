@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+Device = Union[str, torch.device]
+
 # Default values for rotation and translation matrices.
 _R = torch.eye(3)[None]  # (1, 3, 3)
 _T = torch.zeros(1, 3)  # (1, 3)
