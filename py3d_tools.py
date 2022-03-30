@@ -36,154 +36,6 @@ elif sys.version_info >= (3, 7, 0):
 else:
     raise ImportError("This module requires Python 3.7+")
 
-#######################################################################################
-##  ██████╗ ███████╗███████╗██╗███╗   ██╗██╗████████╗██╗ ██████╗ ███╗   ██╗███████╗  ##
-##  ██╔══██╗██╔════╝██╔════╝██║████╗  ██║██║╚══██╔══╝██║██╔═══██╗████╗  ██║██╔════╝  ##
-##  ██║  ██║█████╗  █████╗  ██║██╔██╗ ██║██║   ██║   ██║██║   ██║██╔██╗ ██║███████╗  ##
-##  ██║  ██║██╔══╝  ██╔══╝  ██║██║╚██╗██║██║   ██║   ██║██║   ██║██║╚██╗██║╚════██║  ##
-##  ██████╔╝███████╗██║     ██║██║ ╚████║██║   ██║   ██║╚██████╔╝██║ ╚████║███████║  ##
-##  ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝  ##
-#######################################################################################                                                                               
-
-def make_device(device: Device) -> torch.device:
-    """
-    Makes an actual torch.device object from the device specified as
-    either a string or torch.device object. If the device is `cuda` without
-    a specific index, the index of the current device is assigned.
-    Args:
-        device: Device (as str or torch.device)
-    Returns:
-        A matching torch.device object
-    """
-    device = torch.device(device) if isinstance(device, str) else device
-    if device.type == "cuda" and device.index is None:  # pyre-ignore[16]
-        # If cuda but with no index, then the current cuda device is indicated.
-        # In that case, we fix to that device
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    return device
-
-def get_world_to_view_transform(
-    R: torch.Tensor = _R, T: torch.Tensor = _T
-) -> Transform3d:
-    """
-    This function returns a Transform3d representing the transformation
-    matrix to go from world space to view space by applying a rotation and
-    a translation.
-
-    PyTorch3D uses the same convention as Hartley & Zisserman.
-    I.e., for camera extrinsic parameters R (rotation) and T (translation),
-    we map a 3D point `X_world` in world coordinates to
-    a point `X_cam` in camera coordinates with:
-    `X_cam = X_world R + T`
-
-    Args:
-        R: (N, 3, 3) matrix representing the rotation.
-        T: (N, 3) matrix representing the translation.
-
-    Returns:
-        a Transform3d object which represents the composed RT transformation.
-
-    """
-    # TODO: also support the case where RT is specified as one matrix
-    # of shape (N, 4, 4).
-
-    if T.shape[0] != R.shape[0]:
-        msg = "Expected R, T to have the same batch dimension; got %r, %r"
-        raise ValueError(msg % (R.shape[0], T.shape[0]))
-    if T.dim() != 2 or T.shape[1:] != (3,):
-        msg = "Expected T to have shape (N, 3); got %r"
-        raise ValueError(msg % repr(T.shape))
-    if R.dim() != 3 or R.shape[1:] != (3, 3):
-        msg = "Expected R to have shape (N, 3, 3); got %r"
-        raise ValueError(msg % repr(R.shape))
-
-    # Create a Transform3d object
-    T_ = Translate(T, device=T.device)
-    R_ = Rotate(R, device=R.device)
-    return R_.compose(T_)
-
-def get_full_projection_transform(self, **kwargs) -> Transform3d:
-    """
-    Return the full world-to-camera transform composing the
-    world-to-view and view-to-camera transforms.
-    If camera is defined in NDC space, the projected points are in NDC space.
-    If camera is defined in screen space, the projected points are in screen space.
-
-    Args:
-        **kwargs: parameters for the projection transforms can be passed in
-            as keyword arguments to override the default values
-            set in __init__.
-    Setting R and T here will update the values set in init as these
-    values may be needed later on in the rendering pipeline e.g. for
-    lighting calculations.
-
-    Returns:
-        a Transform3d object which represents a batch of transforms
-        of shape (N, 3, 3)
-    """
-    self.R: torch.Tensor = kwargs.get("R", self.R)  # pyre-ignore[16]
-    self.T: torch.Tensor = kwargs.get("T", self.T)  # pyre-ignore[16]
-    world_to_view_transform = self.get_world_to_view_transform(R=self.R, T=self.T)
-    view_to_proj_transform = self.get_projection_transform(**kwargs)
-    return world_to_view_transform.compose(view_to_proj_transform)
-    
-def _axis_angle_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
-    """
-    Return the rotation matrices for one of the rotations about an axis
-    of which Euler angles describe, for each value of the angle given.
-
-    Args:
-        axis: Axis label "X" or "Y or "Z".
-        angle: any shape tensor of Euler angles in radians
-
-    Returns:
-        Rotation matrices as tensor of shape (..., 3, 3).
-    """
-
-    cos = torch.cos(angle)
-    sin = torch.sin(angle)
-    one = torch.ones_like(angle)
-    zero = torch.zeros_like(angle)
-
-    if axis == "X":
-        R_flat = (one, zero, zero, zero, cos, -sin, zero, sin, cos)
-    elif axis == "Y":
-        R_flat = (cos, zero, sin, zero, one, zero, -sin, zero, cos)
-    elif axis == "Z":
-        R_flat = (cos, -sin, zero, sin, cos, zero, zero, zero, one)
-    else:
-        raise ValueError("letter must be either X, Y or Z.")
-
-    return torch.stack(R_flat, -1).reshape(angle.shape + (3, 3))
-
-def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch.Tensor:
-    """
-    Convert rotations given as Euler angles in radians to rotation matrices.
-
-    Args:
-        euler_angles: Euler angles in radians as tensor of shape (..., 3).
-        convention: Convention string of three uppercase letters from
-            {"X", "Y", and "Z"}.
-
-    Returns:
-        Rotation matrices as tensor of shape (..., 3, 3).
-    """
-    if euler_angles.dim() == 0 or euler_angles.shape[-1] != 3:
-        raise ValueError("Invalid input euler angles.")
-    if len(convention) != 3:
-        raise ValueError("Convention must have 3 letters.")
-    if convention[1] in (convention[0], convention[2]):
-        raise ValueError(f"Invalid convention {convention}.")
-    for letter in convention:
-        if letter not in ("X", "Y", "Z"):
-            raise ValueError(f"Invalid letter {letter} in convention string.")
-    matrices = [
-        _axis_angle_rotation(c, e)
-        for c, e in zip(convention, torch.unbind(euler_angles, -1))
-    ]
-    # return functools.reduce(torch.matmul, matrices)
-    return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
-
 ################################################################
 ##   ██████╗██╗      █████╗ ███████╗███████╗███████╗███████╗  ##
 ##  ██╔════╝██║     ██╔══██╗██╔════╝██╔════╝██╔════╝██╔════╝  ##
@@ -974,3 +826,151 @@ class FoVPerspectiveCameras(CamerasBase):
 
     def in_ndc(self):
         return True
+
+#######################################################################################
+##  ██████╗ ███████╗███████╗██╗███╗   ██╗██╗████████╗██╗ ██████╗ ███╗   ██╗███████╗  ##
+##  ██╔══██╗██╔════╝██╔════╝██║████╗  ██║██║╚══██╔══╝██║██╔═══██╗████╗  ██║██╔════╝  ##
+##  ██║  ██║█████╗  █████╗  ██║██╔██╗ ██║██║   ██║   ██║██║   ██║██╔██╗ ██║███████╗  ##
+##  ██║  ██║██╔══╝  ██╔══╝  ██║██║╚██╗██║██║   ██║   ██║██║   ██║██║╚██╗██║╚════██║  ##
+##  ██████╔╝███████╗██║     ██║██║ ╚████║██║   ██║   ██║╚██████╔╝██║ ╚████║███████║  ##
+##  ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝  ╚═══╝╚═╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝  ##
+#######################################################################################                                                                               
+
+def make_device(device: Device) -> torch.device:
+    """
+    Makes an actual torch.device object from the device specified as
+    either a string or torch.device object. If the device is `cuda` without
+    a specific index, the index of the current device is assigned.
+    Args:
+        device: Device (as str or torch.device)
+    Returns:
+        A matching torch.device object
+    """
+    device = torch.device(device) if isinstance(device, str) else device
+    if device.type == "cuda" and device.index is None:  # pyre-ignore[16]
+        # If cuda but with no index, then the current cuda device is indicated.
+        # In that case, we fix to that device
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    return device
+
+def get_world_to_view_transform(
+    R: torch.Tensor = _R, T: torch.Tensor = _T
+) -> Transform3d:
+    """
+    This function returns a Transform3d representing the transformation
+    matrix to go from world space to view space by applying a rotation and
+    a translation.
+
+    PyTorch3D uses the same convention as Hartley & Zisserman.
+    I.e., for camera extrinsic parameters R (rotation) and T (translation),
+    we map a 3D point `X_world` in world coordinates to
+    a point `X_cam` in camera coordinates with:
+    `X_cam = X_world R + T`
+
+    Args:
+        R: (N, 3, 3) matrix representing the rotation.
+        T: (N, 3) matrix representing the translation.
+
+    Returns:
+        a Transform3d object which represents the composed RT transformation.
+
+    """
+    # TODO: also support the case where RT is specified as one matrix
+    # of shape (N, 4, 4).
+
+    if T.shape[0] != R.shape[0]:
+        msg = "Expected R, T to have the same batch dimension; got %r, %r"
+        raise ValueError(msg % (R.shape[0], T.shape[0]))
+    if T.dim() != 2 or T.shape[1:] != (3,):
+        msg = "Expected T to have shape (N, 3); got %r"
+        raise ValueError(msg % repr(T.shape))
+    if R.dim() != 3 or R.shape[1:] != (3, 3):
+        msg = "Expected R to have shape (N, 3, 3); got %r"
+        raise ValueError(msg % repr(R.shape))
+
+    # Create a Transform3d object
+    T_ = Translate(T, device=T.device)
+    R_ = Rotate(R, device=R.device)
+    return R_.compose(T_)
+
+def get_full_projection_transform(self, **kwargs) -> Transform3d:
+    """
+    Return the full world-to-camera transform composing the
+    world-to-view and view-to-camera transforms.
+    If camera is defined in NDC space, the projected points are in NDC space.
+    If camera is defined in screen space, the projected points are in screen space.
+
+    Args:
+        **kwargs: parameters for the projection transforms can be passed in
+            as keyword arguments to override the default values
+            set in __init__.
+    Setting R and T here will update the values set in init as these
+    values may be needed later on in the rendering pipeline e.g. for
+    lighting calculations.
+
+    Returns:
+        a Transform3d object which represents a batch of transforms
+        of shape (N, 3, 3)
+    """
+    self.R: torch.Tensor = kwargs.get("R", self.R)  # pyre-ignore[16]
+    self.T: torch.Tensor = kwargs.get("T", self.T)  # pyre-ignore[16]
+    world_to_view_transform = self.get_world_to_view_transform(R=self.R, T=self.T)
+    view_to_proj_transform = self.get_projection_transform(**kwargs)
+    return world_to_view_transform.compose(view_to_proj_transform)
+    
+def _axis_angle_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
+    """
+    Return the rotation matrices for one of the rotations about an axis
+    of which Euler angles describe, for each value of the angle given.
+
+    Args:
+        axis: Axis label "X" or "Y or "Z".
+        angle: any shape tensor of Euler angles in radians
+
+    Returns:
+        Rotation matrices as tensor of shape (..., 3, 3).
+    """
+
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    one = torch.ones_like(angle)
+    zero = torch.zeros_like(angle)
+
+    if axis == "X":
+        R_flat = (one, zero, zero, zero, cos, -sin, zero, sin, cos)
+    elif axis == "Y":
+        R_flat = (cos, zero, sin, zero, one, zero, -sin, zero, cos)
+    elif axis == "Z":
+        R_flat = (cos, -sin, zero, sin, cos, zero, zero, zero, one)
+    else:
+        raise ValueError("letter must be either X, Y or Z.")
+
+    return torch.stack(R_flat, -1).reshape(angle.shape + (3, 3))
+
+def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch.Tensor:
+    """
+    Convert rotations given as Euler angles in radians to rotation matrices.
+
+    Args:
+        euler_angles: Euler angles in radians as tensor of shape (..., 3).
+        convention: Convention string of three uppercase letters from
+            {"X", "Y", and "Z"}.
+
+    Returns:
+        Rotation matrices as tensor of shape (..., 3, 3).
+    """
+    if euler_angles.dim() == 0 or euler_angles.shape[-1] != 3:
+        raise ValueError("Invalid input euler angles.")
+    if len(convention) != 3:
+        raise ValueError("Convention must have 3 letters.")
+    if convention[1] in (convention[0], convention[2]):
+        raise ValueError(f"Invalid convention {convention}.")
+    for letter in convention:
+        if letter not in ("X", "Y", "Z"):
+            raise ValueError(f"Invalid letter {letter} in convention string.")
+    matrices = [
+        _axis_angle_rotation(c, e)
+        for c, e in zip(convention, torch.unbind(euler_angles, -1))
+    ]
+    # return functools.reduce(torch.matmul, matrices)
+    return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
