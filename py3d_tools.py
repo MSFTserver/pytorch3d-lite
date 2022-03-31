@@ -974,3 +974,29 @@ def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch
     ]
     # return functools.reduce(torch.matmul, matrices)
     return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
+
+def _check_valid_rotation_matrix(R, tol: float = 1e-7) -> None:
+    """
+    Determine if R is a valid rotation matrix by checking it satisfies the
+    following conditions:
+
+    ``RR^T = I and det(R) = 1``
+
+    Args:
+        R: an (N, 3, 3) matrix
+
+    Returns:
+        None
+
+    Emits a warning if R is an invalid rotation matrix.
+    """
+    N = R.shape[0]
+    eye = torch.eye(3, dtype=R.dtype, device=R.device)
+    eye = eye.view(1, 3, 3).expand(N, -1, -1)
+    orthogonal = torch.allclose(R.bmm(R.transpose(1, 2)), eye, atol=tol)
+    det_R = _safe_det_3x3(R)
+    no_distortion = torch.allclose(det_R, torch.ones_like(det_R))
+    if not (orthogonal and no_distortion):
+        msg = "R is not a valid rotation matrix"
+        warnings.warn(msg)
+    return
