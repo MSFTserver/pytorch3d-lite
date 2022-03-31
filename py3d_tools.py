@@ -1646,3 +1646,85 @@ def convert_to_tensors_and_broadcast(
 
     return args_Nd
 
+def _handle_coord(c, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """
+    Helper function for _handle_input.
+
+    Args:
+        c: Python scalar, torch scalar, or 1D torch tensor
+
+    Returns:
+        c_vec: 1D torch tensor
+    """
+    if not torch.is_tensor(c):
+        c = torch.tensor(c, dtype=dtype, device=device)
+    if c.dim() == 0:
+        c = c.view(1)
+    if c.device != device or c.dtype != dtype:
+        c = c.to(device=device, dtype=dtype)
+    return c
+
+def _handle_input(
+    x,
+    y,
+    z,
+    dtype: torch.dtype,
+    device: Optional[Device],
+    name: str,
+    allow_singleton: bool = False,
+) -> torch.Tensor:
+    """
+    Helper function to handle parsing logic for building transforms. The output
+    is always a tensor of shape (N, 3), but there are several types of allowed
+    input.
+
+    Case I: Single Matrix
+        In this case x is a tensor of shape (N, 3), and y and z are None. Here just
+        return x.
+
+    Case II: Vectors and Scalars
+        In this case each of x, y, and z can be one of the following
+            - Python scalar
+            - Torch scalar
+            - Torch tensor of shape (N, 1) or (1, 1)
+        In this case x, y and z are broadcast to tensors of shape (N, 1)
+        and concatenated to a tensor of shape (N, 3)
+
+    Case III: Singleton (only if allow_singleton=True)
+        In this case y and z are None, and x can be one of the following:
+            - Python scalar
+            - Torch scalar
+            - Torch tensor of shape (N, 1) or (1, 1)
+        Here x will be duplicated 3 times, and we return a tensor of shape (N, 3)
+
+    Returns:
+        xyz: Tensor of shape (N, 3)
+    """
+    device_ = get_device(x, device)
+    # If x is actually a tensor of shape (N, 3) then just return it
+    if torch.is_tensor(x) and x.dim() == 2:
+        if x.shape[1] != 3:
+            msg = "Expected tensor of shape (N, 3); got %r (in %s)"
+            raise ValueError(msg % (x.shape, name))
+        if y is not None or z is not None:
+            msg = "Expected y and z to be None (in %s)" % name
+            raise ValueError(msg)
+        return x.to(device=device_, dtype=dtype)
+
+    if allow_singleton and y is None and z is None:
+        y = x
+        z = x
+
+    # Convert all to 1D tensors
+    xyz = [_handle_coord(c, dtype, device_) for c in [x, y, z]]
+
+    # Broadcast and concatenate
+    sizes = [c.shape[0] for c in xyz]
+    N = max(sizes)
+    for c in xyz:
+        if c.shape[0] != 1 and c.shape[0] != N:
+            msg = "Got non-broadcastable sizes %r (in %s)" % (sizes, name)
+            raise ValueError(msg)
+    xyz = [c.expand(N) for c in xyz]
+    xyz = torch.stack(xyz, dim=1)
+    return xyz
