@@ -1515,6 +1515,42 @@ def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch
     # return functools.reduce(torch.matmul, matrices)
     return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
 
+def get_world_to_view_transform(
+    R: torch.Tensor = _R, T: torch.Tensor = _T
+) -> Transform3d:
+    """
+    This function returns a Transform3d representing the transformation
+    matrix to go from world space to view space by applying a rotation and
+    a translation.
+    PyTorch3D uses the same convention as Hartley & Zisserman.
+    I.e., for camera extrinsic parameters R (rotation) and T (translation),
+    we map a 3D point `X_world` in world coordinates to
+    a point `X_cam` in camera coordinates with:
+    `X_cam = X_world R + T`
+    Args:
+        R: (N, 3, 3) matrix representing the rotation.
+        T: (N, 3) matrix representing the translation.
+    Returns:
+        a Transform3d object which represents the composed RT transformation.
+    """
+    # TODO: also support the case where RT is specified as one matrix
+    # of shape (N, 4, 4).
+
+    if T.shape[0] != R.shape[0]:
+        msg = "Expected R, T to have the same batch dimension; got %r, %r"
+        raise ValueError(msg % (R.shape[0], T.shape[0]))
+    if T.dim() != 2 or T.shape[1:] != (3,):
+        msg = "Expected T to have shape (N, 3); got %r"
+        raise ValueError(msg % repr(T.shape))
+    if R.dim() != 3 or R.shape[1:] != (3, 3):
+        msg = "Expected R to have shape (N, 3, 3); got %r"
+        raise ValueError(msg % repr(R.shape))
+
+    # Create a Transform3d object
+    T_ = Translate(T, device=T.device)
+    R_ = Rotate(R, device=R.device)
+    return R_.compose(T_)
+
 def _check_valid_rotation_matrix(R, tol: float = 1e-7) -> None:
     """
     Determine if R is a valid rotation matrix by checking it satisfies the
