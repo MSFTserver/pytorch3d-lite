@@ -580,6 +580,607 @@ class Rotate(Transform3d):
         """
         return self._matrix.permute(0, 2, 1).contiguous()
 
+class TensorAccessor(nn.Module):
+    """
+    A helper class to be used with the __getitem__ method. This can be used for
+    getting/setting the values for an attribute of a class at one particular
+    index.  This is useful when the attributes of a class are batched tensors
+    and one element in the batch needs to be modified.
+    """
+
+    def __init__(self, class_object, index: Union[int, slice]) -> None:
+        """
+        Args:
+            class_object: this should be an instance of a class which has
+                attributes which are tensors representing a batch of
+                values.
+            index: int/slice, an index indicating the position in the batch.
+                In __setattr__ and __getattr__ only the value of class
+                attributes at this index will be accessed.
+        """
+        self.__dict__["class_object"] = class_object
+        self.__dict__["index"] = index
+
+    def __setattr__(self, name: str, value: Any):
+        """
+        Update the attribute given by `name` to the value given by `value`
+        at the index specified by `self.index`.
+        Args:
+            name: str, name of the attribute.
+            value: value to set the attribute to.
+        """
+        v = getattr(self.class_object, name)
+        if not torch.is_tensor(v):
+            msg = "Can only set values on attributes which are tensors; got %r"
+            raise AttributeError(msg % type(v))
+
+        # Convert the attribute to a tensor if it is not a tensor.
+        if not torch.is_tensor(value):
+            value = torch.tensor(
+                value, device=v.device, dtype=v.dtype, requires_grad=v.requires_grad
+            )
+
+        # Check the shapes match the existing shape and the shape of the index.
+        if v.dim() > 1 and value.dim() > 1 and value.shape[1:] != v.shape[1:]:
+            msg = "Expected value to have shape %r; got %r"
+            raise ValueError(msg % (v.shape, value.shape))
+        if (
+            v.dim() == 0
+            and isinstance(self.index, slice)
+            and len(value) != len(self.index)
+        ):
+            msg = "Expected value to have len %r; got %r"
+            raise ValueError(msg % (len(self.index), len(value)))
+        self.class_object.__dict__[name][self.index] = value
+
+    def __getattr__(self, name: str):
+        """
+        Return the value of the attribute given by "name" on self.class_object
+        at the index specified in self.index.
+        Args:
+            name: string of the attribute name
+        """
+        if hasattr(self.class_object, name):
+            return self.class_object.__dict__[name][self.index]
+        else:
+            msg = "Attribute %s not found on %r"
+            return AttributeError(msg % (name, self.class_object.__name__))
+
+BROADCAST_TYPES = (float, int, list, tuple, torch.Tensor, np.ndarray)
+
+class TensorProperties(nn.Module):
+    """
+    A mix-in class for storing tensors as properties with helper methods.
+    """
+
+    def __init__(
+        self,
+        dtype: torch.dtype = torch.float32,
+        device: Device = "cpu",
+        **kwargs,
+    ) -> None:
+        """
+        Args:
+            dtype: data type to set for the inputs
+            device: Device (as str or torch.device)
+            kwargs: any number of keyword arguments. Any arguments which are
+                of type (float/int/list/tuple/tensor/array) are broadcasted and
+                other keyword arguments are set as attributes.
+        """
+        super().__init__()
+        self.device = make_device(device)
+        self._N = 0
+        if kwargs is not None:
+
+            # broadcast all inputs which are float/int/list/tuple/tensor/array
+            # set as attributes anything else e.g. strings, bools
+            args_to_broadcast = {}
+            for k, v in kwargs.items():
+                if v is None or isinstance(v, (str, bool)):
+                    setattr(self, k, v)
+                elif isinstance(v, BROADCAST_TYPES):
+                    args_to_broadcast[k] = v
+                else:
+                    msg = "Arg %s with type %r is not broadcastable"
+                    warnings.warn(msg % (k, type(v)))
+
+            names = args_to_broadcast.keys()
+            # convert from type dict.values to tuple
+            values = tuple(v for v in args_to_broadcast.values())
+
+            if len(values) > 0:
+                broadcasted_values = convert_to_tensors_and_broadcast(
+                    *values, device=device
+                )
+
+                # Set broadcasted values as attributes on self.
+                for i, n in enumerate(names):
+                    setattr(self, n, broadcasted_values[i])
+                    if self._N == 0:
+                        self._N = broadcasted_values[i].shape[0]
+
+    def __len__(self) -> int:
+        return self._N
+
+    def isempty(self) -> bool:
+        return self._N == 0
+
+    def __getitem__(self, index: Union[int, slice]) -> TensorAccessor:
+        """
+        Args:
+            index: an int or slice used to index all the fields.
+        Returns:
+            if `index` is an index int/slice return a TensorAccessor class
+            with getattribute/setattribute methods which return/update the value
+            at the index in the original class.
+        """
+        if isinstance(index, (int, slice)):
+            return TensorAccessor(class_object=self, index=index)
+
+        msg = "Expected index of type int or slice; got %r"
+        raise ValueError(msg % type(index))
+
+    # pyre-fixme[14]: `to` overrides method defined in `Module` inconsistently.
+    def to(self, device: Device = "cpu") -> "TensorProperties":
+        """
+        In place operation to move class properties which are tensors to a
+        specified device. If self has a property "device", update this as well.
+        """
+        device_ = make_device(device)
+        for k in dir(self):
+            v = getattr(self, k)
+            if k == "device":
+                setattr(self, k, device_)
+            if torch.is_tensor(v) and v.device != device_:
+                setattr(self, k, v.to(device_))
+        return self
+
+    def cpu(self) -> "TensorProperties":
+        return self.to("cpu")
+
+    # pyre-fixme[14]: `cuda` overrides method defined in `Module` inconsistently.
+    def cuda(self, device: Optional[int] = None) -> "TensorProperties":
+        return self.to(f"cuda:{device}" if device is not None else "cuda")
+
+    def clone(self, other) -> "TensorProperties":
+        """
+        Update the tensor properties of other with the cloned properties of self.
+        """
+        for k in dir(self):
+            v = getattr(self, k)
+            if inspect.ismethod(v) or k.startswith("__"):
+                continue
+            if torch.is_tensor(v):
+                v_clone = v.clone()
+            else:
+                v_clone = copy.deepcopy(v)
+            setattr(other, k, v_clone)
+        return other
+
+    def gather_props(self, batch_idx) -> "TensorProperties":
+        """
+        This is an in place operation to reformat all tensor class attributes
+        based on a set of given indices using torch.gather. This is useful when
+        attributes which are batched tensors e.g. shape (N, 3) need to be
+        multiplied with another tensor which has a different first dimension
+        e.g. packed vertices of shape (V, 3).
+        Example
+        .. code-block:: python
+            self.specular_color = (N, 3) tensor of specular colors for each mesh
+        A lighting calculation may use
+        .. code-block:: python
+            verts_packed = meshes.verts_packed()  # (V, 3)
+        To multiply these two tensors the batch dimension needs to be the same.
+        To achieve this we can do
+        .. code-block:: python
+            batch_idx = meshes.verts_packed_to_mesh_idx()  # (V)
+        This gives index of the mesh for each vertex in verts_packed.
+        .. code-block:: python
+            self.gather_props(batch_idx)
+            self.specular_color = (V, 3) tensor with the specular color for
+                                     each packed vertex.
+        torch.gather requires the index tensor to have the same shape as the
+        input tensor so this method takes care of the reshaping of the index
+        tensor to use with class attributes with arbitrary dimensions.
+        Args:
+            batch_idx: shape (B, ...) where `...` represents an arbitrary
+                number of dimensions
+        Returns:
+            self with all properties reshaped. e.g. a property with shape (N, 3)
+            is transformed to shape (B, 3).
+        """
+        # Iterate through the attributes of the class which are tensors.
+        for k in dir(self):
+            v = getattr(self, k)
+            if torch.is_tensor(v):
+                if v.shape[0] > 1:
+                    # There are different values for each batch element
+                    # so gather these using the batch_idx.
+                    # First clone the input batch_idx tensor before
+                    # modifying it.
+                    _batch_idx = batch_idx.clone()
+                    idx_dims = _batch_idx.shape
+                    tensor_dims = v.shape
+                    if len(idx_dims) > len(tensor_dims):
+                        msg = "batch_idx cannot have more dimensions than %s. "
+                        msg += "got shape %r and %s has shape %r"
+                        raise ValueError(msg % (k, idx_dims, k, tensor_dims))
+                    if idx_dims != tensor_dims:
+                        # To use torch.gather the index tensor (_batch_idx) has
+                        # to have the same shape as the input tensor.
+                        new_dims = len(tensor_dims) - len(idx_dims)
+                        new_shape = idx_dims + (1,) * new_dims
+                        expand_dims = (-1,) + tensor_dims[1:]
+                        _batch_idx = _batch_idx.view(*new_shape)
+                        _batch_idx = _batch_idx.expand(*expand_dims)
+
+                    v = v.gather(0, _batch_idx)
+                    setattr(self, k, v)
+        return self
+
+class CamerasBase(TensorProperties):
+    """
+    `CamerasBase` implements a base class for all cameras.
+    For cameras, there are four different coordinate systems (or spaces)
+    - World coordinate system: This is the system the object lives - the world.
+    - Camera view coordinate system: This is the system that has its origin on the camera
+        and the and the Z-axis perpendicular to the image plane.
+        In PyTorch3D, we assume that +X points left, and +Y points up and
+        +Z points out from the image plane.
+        The transformation from world --> view happens after applying a rotation (R)
+        and translation (T)
+    - NDC coordinate system: This is the normalized coordinate system that confines
+        in a volume the rendered part of the object or scene. Also known as view volume.
+        For square images, given the PyTorch3D convention, (+1, +1, znear)
+        is the top left near corner, and (-1, -1, zfar) is the bottom right far
+        corner of the volume.
+        The transformation from view --> NDC happens after applying the camera
+        projection matrix (P) if defined in NDC space.
+        For non square images, we scale the points such that smallest side
+        has range [-1, 1] and the largest side has range [-u, u], with u > 1.
+    - Screen coordinate system: This is another representation of the view volume with
+        the XY coordinates defined in image space instead of a normalized space.
+    A better illustration of the coordinate systems can be found in
+    pytorch3d/docs/notes/cameras.md.
+    It defines methods that are common to all camera models:
+        - `get_camera_center` that returns the optical center of the camera in
+            world coordinates
+        - `get_world_to_view_transform` which returns a 3D transform from
+            world coordinates to the camera view coordinates (R, T)
+        - `get_full_projection_transform` which composes the projection
+            transform (P) with the world-to-view transform (R, T)
+        - `transform_points` which takes a set of input points in world coordinates and
+            projects to the space the camera is defined in (NDC or screen)
+        - `get_ndc_camera_transform` which defines the transform from screen/NDC to
+            PyTorch3D's NDC space
+        - `transform_points_ndc` which takes a set of points in world coordinates and
+            projects them to PyTorch3D's NDC space
+        - `transform_points_screen` which takes a set of points in world coordinates and
+            projects them to screen space
+    For each new camera, one should implement the `get_projection_transform`
+    routine that returns the mapping from camera view coordinates to camera
+    coordinates (NDC or screen).
+    Another useful function that is specific to each camera model is
+    `unproject_points` which sends points from camera coordinates (NDC or screen)
+    back to camera view or world coordinates depending on the `world_coordinates`
+    boolean argument of the function.
+    """
+
+    # Used in __getitem__ to index the relevant fields
+    # When creating a new camera, this should be set in the __init__
+    _FIELDS: Tuple[str, ...] = ()
+
+    # Names of fields which are a constant property of the whole batch, rather
+    # than themselves a batch of data.
+    # When joining objects into a batch, they will have to agree.
+    _SHARED_FIELDS: Tuple[str, ...] = ()
+
+    def get_projection_transform(self):
+        """
+        Calculate the projective transformation matrix.
+        Args:
+            **kwargs: parameters for the projection can be passed in as keyword
+                arguments to override the default values set in `__init__`.
+        Return:
+            a `Transform3d` object which represents a batch of projection
+            matrices of shape (N, 3, 3)
+        """
+        raise NotImplementedError()
+
+    def unproject_points(self, xy_depth: torch.Tensor, **kwargs):
+        """
+        Transform input points from camera coodinates (NDC or screen)
+        to the world / camera coordinates.
+        Each of the input points `xy_depth` of shape (..., 3) is
+        a concatenation of the x, y location and its depth.
+        For instance, for an input 2D tensor of shape `(num_points, 3)`
+        `xy_depth` takes the following form:
+            `xy_depth[i] = [x[i], y[i], depth[i]]`,
+        for a each point at an index `i`.
+        The following example demonstrates the relationship between
+        `transform_points` and `unproject_points`:
+        .. code-block:: python
+            cameras = # camera object derived from CamerasBase
+            xyz = # 3D points of shape (batch_size, num_points, 3)
+            # transform xyz to the camera view coordinates
+            xyz_cam = cameras.get_world_to_view_transform().transform_points(xyz)
+            # extract the depth of each point as the 3rd coord of xyz_cam
+            depth = xyz_cam[:, :, 2:]
+            # project the points xyz to the camera
+            xy = cameras.transform_points(xyz)[:, :, :2]
+            # append depth to xy
+            xy_depth = torch.cat((xy, depth), dim=2)
+            # unproject to the world coordinates
+            xyz_unproj_world = cameras.unproject_points(xy_depth, world_coordinates=True)
+            print(torch.allclose(xyz, xyz_unproj_world)) # True
+            # unproject to the camera coordinates
+            xyz_unproj = cameras.unproject_points(xy_depth, world_coordinates=False)
+            print(torch.allclose(xyz_cam, xyz_unproj)) # True
+        Args:
+            xy_depth: torch tensor of shape (..., 3).
+            world_coordinates: If `True`, unprojects the points back to world
+                coordinates using the camera extrinsics `R` and `T`.
+                `False` ignores `R` and `T` and unprojects to
+                the camera view coordinates.
+            from_ndc: If `False` (default), assumes xy part of input is in
+                NDC space if self.in_ndc(), otherwise in screen space. If
+                `True`, assumes xy is in NDC space even if the camera
+                is defined in screen space.
+        Returns
+            new_points: unprojected points with the same shape as `xy_depth`.
+        """
+        raise NotImplementedError()
+
+    def get_camera_center(self, **kwargs) -> torch.Tensor:
+        """
+        Return the 3D location of the camera optical center
+        in the world coordinates.
+        Args:
+            **kwargs: parameters for the camera extrinsics can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+        Setting T here will update the values set in init as this
+        value may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+        Returns:
+            C: a batch of 3D locations of shape (N, 3) denoting
+            the locations of the center of each camera in the batch.
+        """
+        w2v_trans = self.get_world_to_view_transform(**kwargs)
+        P = w2v_trans.inverse().get_matrix()
+        # the camera center is the translation component (the first 3 elements
+        # of the last row) of the inverted world-to-view
+        # transform (4x4 RT matrix)
+        C = P[:, 3, :3]
+        return C
+
+    def get_world_to_view_transform(self, **kwargs) -> Transform3d:
+        """
+        Return the world-to-view transform.
+        Args:
+            **kwargs: parameters for the camera extrinsics can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+        Setting R and T here will update the values set in init as these
+        values may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+        Returns:
+            A Transform3d object which represents a batch of transforms
+            of shape (N, 3, 3)
+        """
+        R: torch.Tensor = kwargs.get("R", self.R)
+        T: torch.Tensor = kwargs.get("T", self.T)
+        self.R = R  # pyre-ignore[16]
+        self.T = T  # pyre-ignore[16]
+        world_to_view_transform = get_world_to_view_transform(R=R, T=T)
+        return world_to_view_transform
+
+    def get_full_projection_transform(self, **kwargs) -> Transform3d:
+        """
+        Return the full world-to-camera transform composing the
+        world-to-view and view-to-camera transforms.
+        If camera is defined in NDC space, the projected points are in NDC space.
+        If camera is defined in screen space, the projected points are in screen space.
+        Args:
+            **kwargs: parameters for the projection transforms can be passed in
+                as keyword arguments to override the default values
+                set in __init__.
+        Setting R and T here will update the values set in init as these
+        values may be needed later on in the rendering pipeline e.g. for
+        lighting calculations.
+        Returns:
+            a Transform3d object which represents a batch of transforms
+            of shape (N, 3, 3)
+        """
+        self.R: torch.Tensor = kwargs.get("R", self.R)  # pyre-ignore[16]
+        self.T: torch.Tensor = kwargs.get("T", self.T)  # pyre-ignore[16]
+        world_to_view_transform = self.get_world_to_view_transform(R=self.R, T=self.T)
+        view_to_proj_transform = self.get_projection_transform(**kwargs)
+        return world_to_view_transform.compose(view_to_proj_transform)
+
+    def transform_points(
+        self, points, eps: Optional[float] = None, **kwargs
+    ) -> torch.Tensor:
+        """
+        Transform input points from world to camera space with the
+        projection matrix defined by the camera.
+        For `CamerasBase.transform_points`, setting `eps > 0`
+        stabilizes gradients since it leads to avoiding division
+        by excessively low numbers for points close to the camera plane.
+        Args:
+            points: torch tensor of shape (..., 3).
+            eps: If eps!=None, the argument is used to clamp the
+                divisor in the homogeneous normalization of the points
+                transformed to the ndc space. Please see
+                `transforms.Transform3d.transform_points` for details.
+                For `CamerasBase.transform_points`, setting `eps > 0`
+                stabilizes gradients since it leads to avoiding division
+                by excessively low numbers for points close to the
+                camera plane.
+        Returns
+            new_points: transformed points with the same shape as the input.
+        """
+        world_to_proj_transform = self.get_full_projection_transform(**kwargs)
+        return world_to_proj_transform.transform_points(points, eps=eps)
+
+    def get_ndc_camera_transform(self, **kwargs) -> Transform3d:
+        """
+        Returns the transform from camera projection space (screen or NDC) to NDC space.
+        For cameras that can be specified in screen space, this transform
+        allows points to be converted from screen to NDC space.
+        The default transform scales the points from [0, W]x[0, H]
+        to [-1, 1]x[-u, u] or [-u, u]x[-1, 1] where u > 1 is the aspect ratio of the image.
+        This function should be modified per camera definitions if need be,
+        e.g. for Perspective/Orthographic cameras we provide a custom implementation.
+        This transform assumes PyTorch3D coordinate system conventions for
+        both the NDC space and the input points.
+        This transform interfaces with the PyTorch3D renderer which assumes
+        input points to the renderer to be in NDC space.
+        """
+        if self.in_ndc():
+            return Transform3d(device=self.device, dtype=torch.float32)
+        else:
+            # For custom cameras which can be defined in screen space,
+            # users might might have to implement the screen to NDC transform based
+            # on the definition of the camera parameters.
+            # See PerspectiveCameras/OrthographicCameras for an example.
+            # We don't flip xy because we assume that world points are in
+            # PyTorch3D coordinates, and thus conversion from screen to ndc
+            # is a mere scaling from image to [-1, 1] scale.
+            image_size = kwargs.get("image_size", self.get_image_size())
+            return get_screen_to_ndc_transform(
+                self, with_xyflip=False, image_size=image_size
+            )
+
+    def transform_points_ndc(
+        self, points, eps: Optional[float] = None, **kwargs
+    ) -> torch.Tensor:
+        """
+        Transforms points from PyTorch3D world/camera space to NDC space.
+        Input points follow the PyTorch3D coordinate system conventions: +X left, +Y up.
+        Output points are in NDC space: +X left, +Y up, origin at image center.
+        Args:
+            points: torch tensor of shape (..., 3).
+            eps: If eps!=None, the argument is used to clamp the
+                divisor in the homogeneous normalization of the points
+                transformed to the ndc space. Please see
+                `transforms.Transform3d.transform_points` for details.
+                For `CamerasBase.transform_points`, setting `eps > 0`
+                stabilizes gradients since it leads to avoiding division
+                by excessively low numbers for points close to the
+                camera plane.
+        Returns
+            new_points: transformed points with the same shape as the input.
+        """
+        world_to_ndc_transform = self.get_full_projection_transform(**kwargs)
+        if not self.in_ndc():
+            to_ndc_transform = self.get_ndc_camera_transform(**kwargs)
+            world_to_ndc_transform = world_to_ndc_transform.compose(to_ndc_transform)
+
+        return world_to_ndc_transform.transform_points(points, eps=eps)
+
+    def transform_points_screen(
+        self, points, eps: Optional[float] = None, **kwargs
+    ) -> torch.Tensor:
+        """
+        Transforms points from PyTorch3D world/camera space to screen space.
+        Input points follow the PyTorch3D coordinate system conventions: +X left, +Y up.
+        Output points are in screen space: +X right, +Y down, origin at top left corner.
+        Args:
+            points: torch tensor of shape (..., 3).
+            eps: If eps!=None, the argument is used to clamp the
+                divisor in the homogeneous normalization of the points
+                transformed to the ndc space. Please see
+                `transforms.Transform3d.transform_points` for details.
+                For `CamerasBase.transform_points`, setting `eps > 0`
+                stabilizes gradients since it leads to avoiding division
+                by excessively low numbers for points close to the
+                camera plane.
+        Returns
+            new_points: transformed points with the same shape as the input.
+        """
+        points_ndc = self.transform_points_ndc(points, eps=eps, **kwargs)
+        image_size = kwargs.get("image_size", self.get_image_size())
+        return get_ndc_to_screen_transform(
+            self, with_xyflip=True, image_size=image_size
+        ).transform_points(points_ndc, eps=eps)
+
+    def clone(self):
+        """
+        Returns a copy of `self`.
+        """
+        cam_type = type(self)
+        other = cam_type(device=self.device)
+        return super().clone(other)
+
+    def is_perspective(self):
+        raise NotImplementedError()
+
+    def in_ndc(self):
+        """
+        Specifies whether the camera is defined in NDC space
+        or in screen (image) space
+        """
+        raise NotImplementedError()
+
+    def get_znear(self):
+        return self.znear if hasattr(self, "znear") else None
+
+    def get_image_size(self):
+        """
+        Returns the image size, if provided, expected in the form of (height, width)
+        The image size is used for conversion of projected points to screen coordinates.
+        """
+        return self.image_size if hasattr(self, "image_size") else None
+
+    def __getitem__(
+        self, index: Union[int, List[int], torch.LongTensor]
+    ) -> "CamerasBase":
+        """
+        Override for the __getitem__ method in TensorProperties which needs to be
+        refactored.
+        Args:
+            index: an int/list/long tensor used to index all the fields in the cameras given by
+                self._FIELDS.
+        Returns:
+            if `index` is an index int/list/long tensor return an instance of the current
+            cameras class with only the values at the selected index.
+        """
+
+        kwargs = {}
+
+        if not isinstance(index, (int, list, torch.LongTensor, torch.cuda.LongTensor)):
+            msg = "Invalid index type, expected int, List[int] or torch.LongTensor; got %r"
+            raise ValueError(msg % type(index))
+
+        if isinstance(index, int):
+            index = [index]
+
+        if max(index) >= len(self):
+            raise ValueError(f"Index {max(index)} is out of bounds for select cameras")
+
+        for field in self._FIELDS:
+            val = getattr(self, field, None)
+            if val is None:
+                continue
+
+            # e.g. "in_ndc" is set as attribute "_in_ndc" on the class
+            # but provided as "in_ndc" on initialization
+            if field.startswith("_"):
+                field = field[1:]
+
+            if isinstance(val, (str, bool)):
+                kwargs[field] = val
+            elif isinstance(val, torch.Tensor):
+                # In the init, all inputs will be converted to
+                # tensors before setting as attributes
+                kwargs[field] = val[index]
+            else:
+                raise ValueError(f"Field {field} type is not supported for indexing")
+
+        kwargs["device"] = self.device
+        return self.__class__(**kwargs)
+
 class FoVPerspectiveCameras(CamerasBase):
     """
     A class which stores a batch of parameters to generate a batch of
@@ -853,71 +1454,6 @@ def make_device(device: Device) -> torch.device:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
     return device
 
-def get_world_to_view_transform(
-    R: torch.Tensor = _R, T: torch.Tensor = _T
-) -> Transform3d:
-    """
-    This function returns a Transform3d representing the transformation
-    matrix to go from world space to view space by applying a rotation and
-    a translation.
-
-    PyTorch3D uses the same convention as Hartley & Zisserman.
-    I.e., for camera extrinsic parameters R (rotation) and T (translation),
-    we map a 3D point `X_world` in world coordinates to
-    a point `X_cam` in camera coordinates with:
-    `X_cam = X_world R + T`
-
-    Args:
-        R: (N, 3, 3) matrix representing the rotation.
-        T: (N, 3) matrix representing the translation.
-
-    Returns:
-        a Transform3d object which represents the composed RT transformation.
-
-    """
-    # TODO: also support the case where RT is specified as one matrix
-    # of shape (N, 4, 4).
-
-    if T.shape[0] != R.shape[0]:
-        msg = "Expected R, T to have the same batch dimension; got %r, %r"
-        raise ValueError(msg % (R.shape[0], T.shape[0]))
-    if T.dim() != 2 or T.shape[1:] != (3,):
-        msg = "Expected T to have shape (N, 3); got %r"
-        raise ValueError(msg % repr(T.shape))
-    if R.dim() != 3 or R.shape[1:] != (3, 3):
-        msg = "Expected R to have shape (N, 3, 3); got %r"
-        raise ValueError(msg % repr(R.shape))
-
-    # Create a Transform3d object
-    T_ = Translate(T, device=T.device)
-    R_ = Rotate(R, device=R.device)
-    return R_.compose(T_)
-
-def get_full_projection_transform(self, **kwargs) -> Transform3d:
-    """
-    Return the full world-to-camera transform composing the
-    world-to-view and view-to-camera transforms.
-    If camera is defined in NDC space, the projected points are in NDC space.
-    If camera is defined in screen space, the projected points are in screen space.
-
-    Args:
-        **kwargs: parameters for the projection transforms can be passed in
-            as keyword arguments to override the default values
-            set in __init__.
-    Setting R and T here will update the values set in init as these
-    values may be needed later on in the rendering pipeline e.g. for
-    lighting calculations.
-
-    Returns:
-        a Transform3d object which represents a batch of transforms
-        of shape (N, 3, 3)
-    """
-    self.R: torch.Tensor = kwargs.get("R", self.R)  # pyre-ignore[16]
-    self.T: torch.Tensor = kwargs.get("T", self.T)  # pyre-ignore[16]
-    world_to_view_transform = self.get_world_to_view_transform(R=self.R, T=self.T)
-    view_to_proj_transform = self.get_projection_transform(**kwargs)
-    return world_to_view_transform.compose(view_to_proj_transform)
-    
 def _axis_angle_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
     """
     Return the rotation matrices for one of the rotations about an axis
@@ -1000,3 +1536,46 @@ def _check_valid_rotation_matrix(R, tol: float = 1e-7) -> None:
         msg = "R is not a valid rotation matrix"
         warnings.warn(msg)
     return
+
+def convert_to_tensors_and_broadcast(
+    *args,
+    dtype: torch.dtype = torch.float32,
+    device: Device = "cpu",
+):
+    """
+    Helper function to handle parsing an arbitrary number of inputs (*args)
+    which all need to have the same batch dimension.
+    The output is a list of tensors.
+    Args:
+        *args: an arbitrary number of inputs
+            Each of the values in `args` can be one of the following
+                - Python scalar
+                - Torch scalar
+                - Torch tensor of shape (N, K_i) or (1, K_i) where K_i are
+                  an arbitrary number of dimensions which can vary for each
+                  value in args. In this case each input is broadcast to a
+                  tensor of shape (N, K_i)
+        dtype: data type to use when creating new tensors.
+        device: torch device on which the tensors should be placed.
+    Output:
+        args: A list of tensors of shape (N, K_i)
+    """
+    # Convert all inputs to tensors with a batch dimension
+    args_1d = [format_tensor(c, dtype, device) for c in args]
+
+    # Find broadcast size
+    sizes = [c.shape[0] for c in args_1d]
+    N = max(sizes)
+
+    args_Nd = []
+    for c in args_1d:
+        if c.shape[0] != 1 and c.shape[0] != N:
+            msg = "Got non-broadcastable sizes %r" % sizes
+            raise ValueError(msg)
+
+        # Expand broadcast dim and keep non broadcast dims the same size
+        expand_sizes = (N,) + (-1,) * len(c.shape[1:])
+        args_Nd.append(c.expand(*expand_sizes))
+
+    return args_Nd
+
