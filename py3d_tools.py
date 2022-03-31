@@ -1541,6 +1541,33 @@ def _check_valid_rotation_matrix(R, tol: float = 1e-7) -> None:
         warnings.warn(msg)
     return
 
+def format_tensor(
+    input,
+    dtype: torch.dtype = torch.float32,
+    device: Device = "cpu",
+) -> torch.Tensor:
+    """
+    Helper function for converting a scalar value to a tensor.
+    Args:
+        input: Python scalar, Python list/tuple, torch scalar, 1D torch tensor
+        dtype: data type for the input
+        device: Device (as str or torch.device) on which the tensor should be placed.
+    Returns:
+        input_vec: torch tensor with optional added batch dimension.
+    """
+    device_ = make_device(device)
+    if not torch.is_tensor(input):
+        input = torch.tensor(input, dtype=dtype, device=device_)
+
+    if input.dim() == 0:
+        input = input.view(1)
+
+    if input.device == device_:
+        return input
+
+    input = input.to(device=device)
+    return input
+
 def convert_to_tensors_and_broadcast(
     *args,
     dtype: torch.dtype = torch.float32,
