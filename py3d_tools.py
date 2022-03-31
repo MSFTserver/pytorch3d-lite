@@ -45,84 +45,6 @@ else:
 ##   ╚═════╝╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝╚══════╝  ##
 ################################################################
 
-class Translate(Transform3d):
-    def __init__(
-        self,
-        x,
-        y=None,
-        z=None,
-        dtype: torch.dtype = torch.float32,
-        device: Optional[Device] = None,
-    ) -> None:
-        """
-        Create a new Transform3d representing 3D translations.
-
-        Option I: Translate(xyz, dtype=torch.float32, device='cpu')
-            xyz should be a tensor of shape (N, 3)
-
-        Option II: Translate(x, y, z, dtype=torch.float32, device='cpu')
-            Here x, y, and z will be broadcast against each other and
-            concatenated to form the translation. Each can be:
-                - A python scalar
-                - A torch scalar
-                - A 1D torch tensor
-        """
-        xyz = _handle_input(x, y, z, dtype, device, "Translate")
-        super().__init__(device=xyz.device, dtype=dtype)
-        N = xyz.shape[0]
-
-        mat = torch.eye(4, dtype=dtype, device=self.device)
-        mat = mat.view(1, 4, 4).repeat(N, 1, 1)
-        mat[:, 3, :3] = xyz
-        self._matrix = mat
-
-    def _get_matrix_inverse(self) -> torch.Tensor:
-        """
-        Return the inverse of self._matrix.
-        """
-        inv_mask = self._matrix.new_ones([1, 4, 4])
-        inv_mask[0, 3, :3] = -1.0
-        i_matrix = self._matrix * inv_mask
-        return i_matrix
-
-class Rotate(Transform3d):
-    def __init__(
-        self,
-        R: torch.Tensor,
-        dtype: torch.dtype = torch.float32,
-        device: Optional[Device] = None,
-        orthogonal_tol: float = 1e-5,
-    ) -> None:
-        """
-        Create a new Transform3d representing 3D rotation using a rotation
-        matrix as the input.
-
-        Args:
-            R: a tensor of shape (3, 3) or (N, 3, 3)
-            orthogonal_tol: tolerance for the test of the orthogonality of R
-
-        """
-        device_ = get_device(R, device)
-        super().__init__(device=device_, dtype=dtype)
-        if R.dim() == 2:
-            R = R[None]
-        if R.shape[-2:] != (3, 3):
-            msg = "R must have shape (3, 3) or (N, 3, 3); got %s"
-            raise ValueError(msg % repr(R.shape))
-        R = R.to(device=device_, dtype=dtype)
-        _check_valid_rotation_matrix(R, tol=orthogonal_tol)
-        N = R.shape[0]
-        mat = torch.eye(4, dtype=dtype, device=device_)
-        mat = mat.view(1, 4, 4).repeat(N, 1, 1)
-        mat[:, :3, :3] = R
-        self._matrix = mat
-
-    def _get_matrix_inverse(self) -> torch.Tensor:
-        """
-        Return the inverse of self._matrix.
-        """
-        return self._matrix.permute(0, 2, 1).contiguous()
-
 class Transform3d:
     """
     A Transform3d object encapsulates a batch of N 3D transformations, and knows
@@ -579,6 +501,84 @@ class Transform3d:
 
     def cuda(self) -> "Transform3d":
         return self.to("cuda")
+
+class Translate(Transform3d):
+    def __init__(
+        self,
+        x,
+        y=None,
+        z=None,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[Device] = None,
+    ) -> None:
+        """
+        Create a new Transform3d representing 3D translations.
+
+        Option I: Translate(xyz, dtype=torch.float32, device='cpu')
+            xyz should be a tensor of shape (N, 3)
+
+        Option II: Translate(x, y, z, dtype=torch.float32, device='cpu')
+            Here x, y, and z will be broadcast against each other and
+            concatenated to form the translation. Each can be:
+                - A python scalar
+                - A torch scalar
+                - A 1D torch tensor
+        """
+        xyz = _handle_input(x, y, z, dtype, device, "Translate")
+        super().__init__(device=xyz.device, dtype=dtype)
+        N = xyz.shape[0]
+
+        mat = torch.eye(4, dtype=dtype, device=self.device)
+        mat = mat.view(1, 4, 4).repeat(N, 1, 1)
+        mat[:, 3, :3] = xyz
+        self._matrix = mat
+
+    def _get_matrix_inverse(self) -> torch.Tensor:
+        """
+        Return the inverse of self._matrix.
+        """
+        inv_mask = self._matrix.new_ones([1, 4, 4])
+        inv_mask[0, 3, :3] = -1.0
+        i_matrix = self._matrix * inv_mask
+        return i_matrix
+
+class Rotate(Transform3d):
+    def __init__(
+        self,
+        R: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[Device] = None,
+        orthogonal_tol: float = 1e-5,
+    ) -> None:
+        """
+        Create a new Transform3d representing 3D rotation using a rotation
+        matrix as the input.
+
+        Args:
+            R: a tensor of shape (3, 3) or (N, 3, 3)
+            orthogonal_tol: tolerance for the test of the orthogonality of R
+
+        """
+        device_ = get_device(R, device)
+        super().__init__(device=device_, dtype=dtype)
+        if R.dim() == 2:
+            R = R[None]
+        if R.shape[-2:] != (3, 3):
+            msg = "R must have shape (3, 3) or (N, 3, 3); got %s"
+            raise ValueError(msg % repr(R.shape))
+        R = R.to(device=device_, dtype=dtype)
+        _check_valid_rotation_matrix(R, tol=orthogonal_tol)
+        N = R.shape[0]
+        mat = torch.eye(4, dtype=dtype, device=device_)
+        mat = mat.view(1, 4, 4).repeat(N, 1, 1)
+        mat[:, :3, :3] = R
+        self._matrix = mat
+
+    def _get_matrix_inverse(self) -> torch.Tensor:
+        """
+        Return the inverse of self._matrix.
+        """
+        return self._matrix.permute(0, 2, 1).contiguous()
 
 class FoVPerspectiveCameras(CamerasBase):
     """
