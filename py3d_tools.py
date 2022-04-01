@@ -1538,6 +1538,33 @@ def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch
     # return functools.reduce(torch.matmul, matrices)
     return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
 
+def _broadcast_bmm(a, b) -> torch.Tensor:
+    """
+    Batch multiply two matrices and broadcast if necessary.
+
+    Args:
+        a: torch tensor of shape (P, K) or (M, P, K)
+        b: torch tensor of shape (N, K, K)
+
+    Returns:
+        a and b broadcast multiplied. The output batch dimension is max(N, M).
+
+    To broadcast transforms across a batch dimension if M != N then
+    expect that either M = 1 or N = 1. The tensor with batch dimension 1 is
+    expanded to have shape N or M.
+    """
+    if a.dim() == 2:
+        a = a[None]
+    if len(a) != len(b):
+        if not ((len(a) == 1) or (len(b) == 1)):
+            msg = "Expected batch dim for bmm to be equal or 1; got %r, %r"
+            raise ValueError(msg % (a.shape, b.shape))
+        if len(a) == 1:
+            a = a.expand(len(b), -1, -1)
+        if len(b) == 1:
+            b = b.expand(len(a), -1, -1)
+    return a.bmm(b)
+
 def _safe_det_3x3(t: torch.Tensor):
     """
     Fast determinant calculation for a batch of 3x3 matrices.
