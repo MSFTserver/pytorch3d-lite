@@ -1538,6 +1538,25 @@ def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch
     # return functools.reduce(torch.matmul, matrices)
     return torch.matmul(torch.matmul(matrices[0], matrices[1]), matrices[2])
 
+def _safe_det_3x3(t: torch.Tensor):
+    """
+    Fast determinant calculation for a batch of 3x3 matrices.
+    Note, result of this function might not be the same as `torch.det()`.
+    The differences might be in the last significant digit.
+    Args:
+        t: Tensor of shape (N, 3, 3).
+    Returns:
+        Tensor of shape (N) with determinants.
+    """
+
+    det = (
+        t[..., 0, 0] * (t[..., 1, 1] * t[..., 2, 2] - t[..., 1, 2] * t[..., 2, 1])
+        - t[..., 0, 1] * (t[..., 1, 0] * t[..., 2, 2] - t[..., 2, 0] * t[..., 1, 2])
+        + t[..., 0, 2] * (t[..., 1, 0] * t[..., 2, 1] - t[..., 2, 0] * t[..., 1, 1])
+    )
+
+    return det
+
 def get_world_to_view_transform(
     R: torch.Tensor = _R, T: torch.Tensor = _T
 ) -> Transform3d:
